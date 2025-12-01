@@ -1,6 +1,0 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-/* small custom tweaks */
-body { background: #f7f8fb; }
