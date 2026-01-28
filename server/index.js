@@ -1,525 +1,302 @@
-// PSych/server/index.js
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import multer from "multer";
-import { Readable } from "stream";
-import fs from "fs";
 import compression from "compression";
-import WebSocket, { WebSocketServer } from "ws";
-import http from "http";
-import OpenAI from "openai";
+import { WebSocketServer } from "ws";
+import fs from "fs";
+import path from "path";
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Configurable chat model for lower latency (set via env: OPENAI_CHAT_MODEL)
-// Use gpt-4o-mini for faster responses with acceptable quality
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini';
-
-// ---------------- Realtime psychologist brain ----------------
-
-const REALTIME_MODEL = "gpt-4o-realtime-preview";
-const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
-
-// Concise therapist system prompt optimized for speed
-const THERAPIST_PROMPT = `You are a supportive psychological companion. Be warm, non-judgmental, and genuine. Listen actively. Ask clarifying questions. Use short paragraphs (2-3 sentences). Reflect feelings: "It sounds like...", "I hear...". If user mentions crisis (self-harm, suicide), say you cannot handle emergencies and strongly recommend contacting local crisis hotlines. You are NOT a licensed therapist. If user speaks Malayalam, respond in Malayalam. Otherwise, respond in English.`.trim();
-
-// 🧠 Realtime helper – gets therapist reply as text
-async function askRealtimePsychologist(userText) {
-  return new Promise((resolve, reject) => {
-    console.log('Connecting to Realtime API...');
-    
-    const ws = new WebSocket(REALTIME_URL, {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    });
-
-    let fullText = "";
-
-    ws.on("open", () => {
-      console.log('✅ Realtime WebSocket opened');
-      ws.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            instructions: THERAPIST_PROMPT,
-            modalities: ["text"], // we get text and then TTS it
-          },
-        })
-      );
-
-      // 2) Add the user's message
-      ws.send(
-        JSON.stringify({
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: userText,
-              },
-            ],
-          },
-        })
-      );
-
-      // 3) Ask the model to respond
-      ws.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["text"],
-          },
-        })
-      );
-    });
-
-    ws.on("message", (data) => {
-      let msg;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch (err) {
-        console.error("Realtime parse error:", err);
-        return;
-      }
-
-      switch (msg.type) {
-        case "response.text.delta":
-          if (msg.delta) fullText += msg.delta;
-          break;
-
-        case "response.done":
-          ws.close();
-          resolve(
-            fullText.trim() ||
-              "I’m here with you. I had trouble forming a full reply. Can you say a bit more?"
-          );
-          break;
-
-        case "error":
-          console.error("Realtime error event:", msg);
-          ws.close();
-          reject(
-            new Error(msg.error?.message || "Realtime error from model")
-          );
-          break;
-
-        default:
-        // ignore other events
-      }
-    });
-
-    ws.on("error", (err) => {
-      console.error("Realtime WS error:", err);
-      reject(err);
-    });
-  });
-}
-
-// 🧠 Chat API helper – streaming for ultra-low latency first-token
-async function askPsychologist(userText) {
-  try {
-    const start = Date.now();
-    let fullReply = '';
-    
-    // Stream for faster first-token time
-    const stream = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        { role: 'system', content: THERAPIST_PROMPT },
-        { role: 'user', content: userText },
-      ],
-      temperature: 0.5,
-      max_tokens: 150,
-      stream: true, // Enable streaming
-    });
-
-    // Consume stream and aggregate response
-    for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content || '';
-      if (delta) fullReply += delta;
-    }
-
-    const duration = Date.now() - start;
-    console.log(`✅ Chat API reply (${duration}ms, ${fullReply.length} chars)`);
-    return fullReply.trim() || "I'm here with you. Let me think about that...";
-  } catch (err) {
-    console.error("Chat API error:", err);
-    throw err;
-  }
-}
-
-// 🔊 Streaming TTS helper – returns async iterator for progressive playback
-async function* streamTextToSpeech(text) {
-  try {
-    console.log(`🔊 Streaming TTS for (${text.length} chars)`);
-    const start = Date.now();
-    
-    const speech = await openai.audio.speech.create({
-      model: 'tts-1',
-      voice: 'alloy',  // alloy is fastest
-      input: text,
-      format: 'mp3',
-    });
-
-    const buffer = Buffer.from(await speech.arrayBuffer());
-    const duration = Date.now() - start;
-    console.log(`✅ TTS audio generated (${duration}ms, ${buffer.length} bytes)`);
-    
-    // Yield chunks to stream progressively
-    const chunkSize = 4096;
-    for (let i = 0; i < buffer.length; i += chunkSize) {
-      yield buffer.slice(i, Math.min(i + chunkSize, buffer.length));
-    }
-  } catch (err) {
-    console.error("TTS error:", err);
-    throw err;
-  }
-}
-
-// ---------------- Middleware ----------------
-
-app.use(cors());
-app.use(express.json());
-app.use(compression()); // Enable gzip compression for all responses
-
-// Add response timing header middleware (set before response is sent)
-app.use((req, res, next) => {
-  const start = Date.now();
-  // Override the send method to add timing header
-  const originalSend = res.send;
-  res.send = function(data) {
-    const duration = Date.now() - start;
-    res.set('X-Response-Time', `${duration}ms`);
-    return originalSend.call(this, data);
-  };
-  next();
-});
-
-// -------- TEXT route (optional, for testing via Thunder Client) --------
-
-app.post("/api/psych", async (req, res) => {
-  try {
-    const { message } = req.body;
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "message is required" });
-    }
-
-    const start = Date.now();
-    console.log('▶ POST /api/psych - start');
-    const reply = await askPsychologist(message);
-    const duration = Date.now() - start;
-    console.log(`✅ POST /api/psych - done (${duration}ms)`);
-    return res.json({ reply, durationMs: duration });
-  } catch (err) {
-    console.error("Error in /api/psych:", err);
-    return res.status(500).json({ error: "Something went wrong" });
-  }
-});
-
-// -------- STREAMING TEXT + AUDIO route (returns NDJSON: text chunks then TTS audio) --------
-
-app.post("/api/psych-stream", async (req, res) => {
-  try {
-    const { message } = req.body;
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "message is required" });
-    }
-
-    const start = Date.now();
-    console.log('▶ POST /api/psych-stream - start');
-
-    // Get the full reply text first
-    const reply = await askPsychologist(message);
-    const textTime = Date.now() - start;
-    console.log(`  └─ Chat API: ${textTime}ms`);
-
-    // Send response in NDJSON format: first the text, then the audio chunks
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('Cache-Control', 'no-cache');
-
-    // 1) Send the full text immediately so UI can display it right away
-    res.write(JSON.stringify({ type: 'text', data: reply }) + '\n');
-
-    // 2) Stream TTS audio chunks in parallel
-    try {
-      let totalBytes = 0;
-      for await (const chunk of streamTextToSpeech(reply)) {
-        totalBytes += chunk.length;
-        // Send audio chunk as base64 in NDJSON
-        res.write(JSON.stringify({ type: 'audio', data: chunk.toString('base64') }) + '\n');
-      }
-      const duration = Date.now() - start;
-      console.log(`✅ POST /api/psych-stream - done (${duration}ms, text at ${textTime}ms, audio ${totalBytes} bytes)`);
-      res.end();
-    } catch (streamErr) {
-      console.error("Error during stream:", streamErr);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Failed during streaming" });
-      } else {
-        res.end();
-      }
-    }
-  } catch (err) {
-    console.error("Error in /api/psych-stream:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Something went wrong" });
-    }
-  }
-});
-
-// -------- REALTIME SESSION ENDPOINTS --------
-
-// Create a realtime session for WebRTC-style bidirectional streaming
-app.post("/api/realtime-session", async (req, res) => {
-  try {
-    const { instructions } = req.body;
-    const systemPrompt = instructions || THERAPIST_PROMPT;
-
-    console.log('🔄 Creating realtime session...');
-    const session = await openai.beta.realtime.sessions.create({
-      model: REALTIME_MODEL,
-      instructions: systemPrompt,
-      voice: "alloy",  // Fast voice for real-time
-      modalities: ["text", "audio"],
-      input_audio_format: "pcm16",
-      output_audio_format: "pcm16",
-      input_audio_transcription: {
-        model: "whisper-1"  // Auto-transcribe user audio
-      }
-    });
-
-    console.log(`✅ Realtime session created: ${session.id}`);
-    return res.json({
-      token: session.client_secret,
-      sessionId: session.id,
-      expiresAt: session.expires_at
-    });
-  } catch (err) {
-    console.error("❌ Error creating realtime session:", err.message);
-    return res.status(500).json({ error: "Failed to create session: " + err.message });
-  }
-});
-
-// Legacy endpoint (kept for compatibility)
-app.get("/api/realtime-token", async (req, res) => {
-  try {
-    // Create a realtime session with OpenAI
-    // This returns a client secret token for WebSocket authentication
-    const session = await openai.beta.realtime.sessions.create({
-      model: REALTIME_MODEL,
-      instructions: THERAPIST_PROMPT,
-      voice: "alloy",
-      modalities: ["text", "audio"],
-    });
-
-    console.log("✅ Realtime session created");
-    return res.json({ token: session.client_secret });
-  } catch (err) {
-    console.error("❌ Error creating realtime token:", err);
-    return res.status(500).json({ error: "Failed to create realtime token" });
-  }
-});
-
-// -------- VOICE route: audio -> text -> therapist -> TTS audio --------
-
-app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
-  try {
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({ error: "No audio file uploaded" });
-    }
-
-    const tStart = Date.now();
-    console.log('▶ POST /api/transcribe - start');
-
-    // 1) Transcribe audio -> text
-    const transcriptionStart = Date.now();
-    const transcription = await openai.audio.transcriptions.create({
-      file: req.file.buffer,
-      filename: req.file.originalname || 'audio.webm',
-      model: "whisper-1",
-    });
-    const transcriptionMs = Date.now() - transcriptionStart;
-    console.log(`  └─ Whisper transcription: ${transcriptionMs}ms`);
-
-    const userText = (transcription.text || "").trim();
-    if (!userText) {
-      return res.status(500).json({ error: "Transcription is empty" });
-    }
-
-    // 2) Get therapist reply via streaming Chat API
-    const chatStart = Date.now();
-    const replyText = await askPsychologist(userText);
-    const chatMs = Date.now() - chatStart;
-    console.log(`  └─ Chat API: ${chatMs}ms`);
-
-    const tDuration = Date.now() - tStart;
-    console.log(`✅ POST /api/transcribe - done (${tDuration}ms: transcribe ${transcriptionMs}ms + chat ${chatMs}ms)`);
-    
-    return res.json({ 
-      userText, 
-      replyText, 
-      durationMs: tDuration,
-      breakdown: { transcriptionMs, chatMs }
-    });
-  } catch (err) {
-    console.error("Error in /api/transcribe:", err);
-    return res.status(500).json({ error: "Something went wrong" });
-  }
-});
-
-// -------- TEXT TO SPEECH route --------
-
-app.post("/api/tts", async (req, res) => {
-  try {
-    const { text } = req.body;
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ error: "text is required" });
-    }
-
-    console.log("🔊 TTS request received, text length:", text.length);
-    const sStart = Date.now();
-
-    // Stream TTS for immediate audio playback
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('Cache-Control', 'no-cache');
-
-    try {
-      let totalBytes = 0;
-      for await (const chunk of streamTextToSpeech(text)) {
-        totalBytes += chunk.length;
-        res.write(chunk);
-      }
-      const sDuration = Date.now() - sStart;
-      console.log(`✅ POST /api/tts - streaming done (${sDuration}ms, ${totalBytes} bytes)`);
-      res.end();
-    } catch (streamErr) {
-      console.error("Error during TTS streaming:", streamErr);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Failed during streaming" });
-      } else {
-        res.end();
-      }
-    }
-  } catch (err) {
-    console.error("❌ Error in /api/tts:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Failed to generate speech" });
-    }
-  }
-});
-
-// ---------------- Start server + WebSocket proxy ----------------
-
 const PORT = process.env.PORT || 3001;
 
-// Create HTTP server so we can attach a WebSocket server to the same port
-const server = http.createServer(app);
+/* ---------------- Logging ---------------- */
 
-// WebSocket server that proxies browser connections to OpenAI Realtime
-const wss = new WebSocketServer({ server, path: "/realtime" });
+const logFile = path.join(process.cwd(), 'aipsych.log');
 
-wss.on("connection", (clientWs, req) => {
-  console.log("Incoming browser WebSocket connection for /realtime", req.socket.remoteAddress);
+function log(message, type = 'INFO') {
+  const timestamp = new Date().toISOString();
+  const logEntry = `[${timestamp}] ${type}: ${message}\n`;
+  
+  console.log(logEntry.trim());
+  fs.appendFile(logFile, logEntry, () => {});
+}
 
-  // Create a backend connection to OpenAI with Authorization header
-  const backendWs = new WebSocket(REALTIME_URL, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
+/* ---------------- Config ---------------- */
 
-  backendWs.on("open", () => {
-    console.log("Proxy: connected to OpenAI realtime (backend open)");
-  });
-
-  backendWs.on("message", (data) => {
-    try {
-      // Try to parse JSON for nicer logging
-      try {
-        const parsed = JSON.parse(data.toString());
-        console.log('Proxy <- OpenAI:', parsed.type || '[no-type]', parsed.event_id || '');
-      } catch (e) {
-        console.log('Proxy <- OpenAI: (non-json) len=', data?.length || data.toString().length);
-      }
-      clientWs.send(data);
-    } catch (err) {
-      console.error("Proxy forward to client failed:", err);
-    }
-  });
-
-  backendWs.on("error", (err) => {
-    console.error("Backend WS error (OpenAI):", err);
-    try {
-      clientWs.send(JSON.stringify({ type: "error", error: { message: "Backend connection error" } }));
-    } catch (e) {
-      // ignore
-    }
-  });
-
-  backendWs.on("close", (code, reason) => {
-    console.log("Backend WS closed", code, reason?.toString?.());
-    try {
-      clientWs.close();
-    } catch (e) {}
-  });
-
-  clientWs.on("message", (msg) => {
-    // Forward client messages to OpenAI
-    try {
-      const asStr = msg.toString();
-      try {
-        const parsed = JSON.parse(asStr);
-        console.log('Proxy -> OpenAI:', parsed.type || '[no-type]');
-      } catch (e) {
-        console.log('Proxy -> OpenAI: (non-json) len=', asStr.length);
-      }
-    } catch (e) {}
-
-    if (backendWs.readyState === WebSocket.OPEN) {
-      backendWs.send(msg);
-    } else {
-      console.warn('Backend WS not open yet, dropping client message');
-    }
-  });
-
-  clientWs.on("close", () => {
-    try {
-      backendWs.close();
-    } catch (e) {}
-  });
-
-  clientWs.on("error", (err) => {
-    console.error("Client WS error:", err);
-    try {
-      backendWs.close();
-    } catch (e) {}
-  });
-});
-
-server.listen(PORT, () => {
-  console.log(`✅ Server listening on http://localhost:${PORT}`);
-  console.log(`✅ WebSocket proxy available at ws://localhost:${PORT}/realtime`);
-});
-
-// Global error handlers
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
+if (!process.env.OPENAI_API_KEY) {
+  log("OPENAI_API_KEY environment variable is required", "ERROR");
   process.exit(1);
+}
+
+if (!process.env.OPENAI_API_KEY.startsWith('sk-')) {
+  log("Invalid OPENAI_API_KEY format. Should start with 'sk-'", "ERROR");
+  process.exit(1);
+}
+
+log("API Key loaded successfully");
+
+const THERAPIST_PROMPTS = {
+  clinical: `
+You are AIPsych. Respond immediately with 1-2 sentences.
+
+Core style:
+- Start responding instantly
+- Keep replies short (1-3 sentences max)
+- No greetings, no restating user input
+- Simple language, direct answers
+- Validate feelings briefly, then respond
+- If user speaks Malayalam, reply in Malayalam
+
+Goal: Fast, helpful, human responses.
+`.trim()
+};
+
+// STEP 1 — NORMALIZE INPUT
+function normalize(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z\u0D00-\u0D7F\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// STEP 2 — KEYWORD CRISIS FILTER (FAST BASELINE)
+const KEYWORD_CRISIS = [
+  // English
+  "kill myself","suicide","want to die","end my life",
+  "no reason to live","self harm","cut myself",
+
+  // Malayalam
+  "മരിക്കാൻ തോന്നുന്നു","മരിക്കണം","ആത്മഹത്യ",
+  "ജീവിതം അവസാനിപ്പ","ജീവിക്കാൻ താല്പര്യമില്ല",
+
+  // Manglish
+  "marikkan thonnunnu","marikkanam","marikkan",
+  "jeevitham maduthu","jeevikkan pattunnilla",
+  "life maduthu","life mathi","ini mathi"
+];
+
+function keywordCrisis(text) {
+  const t = normalize(text);
+  return KEYWORD_CRISIS.some(k => t.includes(k));
+}
+
+// STEP 3 — AI INTENT CLASSIFIER (SAME API KEY)
+async function aiCrisisClassifier(text) {
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{
+          role: "user",
+          content: `You are a classifier.\nReply with ONLY one word: CRISIS or SAFE.\n\nCRISIS includes:\n- Desire to die\n- Self-harm intent\n- Feeling life should end\n- Explicit OR implicit suicidal ideation\n\nMessage:\n"${text}"`
+        }],
+        max_tokens: 5,
+        temperature: 0
+      })
+    });
+    
+    const data = await response.json();
+    return data.choices[0].message.content.trim() === "CRISIS";
+  } catch (err) {
+    console.error("AI classifier error:", err.message);
+    return false; // Fail safe
+  }
+}
+
+function isMalayalam(text) {
+  return /[\u0D00-\u0D7F]/.test(text);
+}
+
+// STEP 4 — HARDCODED CRISIS RESPONSES (NO AI)
+const CRISIS_REPLY_EN = `
+I'm really sorry you're feeling this much pain. I'm glad you said it out loud.
+
+I can't help with emergencies or self-harm, but you deserve immediate, real support.
+Please reach out right now to a local crisis helpline, emergency services,
+or someone you trust nearby and tell them exactly how you're feeling.
+
+If you're in India:
+• AASRA: 91-9820466726 (24/7)
+• Tele MANAS: 14416 (free & confidential)
+Or go to the nearest emergency room.
+
+You don't have to go through this alone.
+`.trim();
+
+const CRISIS_REPLY_ML = `
+ഇപ്പോൾ നിനക്ക് ഇത്രയും വേദന അനുഭവിക്കേണ്ടി വരുന്നത് കേട്ട് എനിക്ക് വളരെ ദുഃഖമുണ്ട്.
+"മരിക്കാൻ തോന്നുന്നു" എന്ന് പറയുന്നത് നീ വലിയ ബുദ്ധിമുട്ടിലൂടെയാണ് പോകുന്നത് എന്നതാണ് സൂചിപ്പിക്കുന്നത്.
+
+എനിക്ക് അടിയന്തര സാഹചര്യങ്ങളിലോ സ്വയം പരിക്കേൽപ്പിക്കുന്ന കാര്യങ്ങളിലോ സഹായിക്കാനാകില്ല.
+എന്നാൽ നിന്റെ സുരക്ഷ വളരെ പ്രധാനമാണ്.
+ദയവായി ഇപ്പോൾ തന്നെ ഒരു സഹായ ഹോട്ട്ലൈനെയോ,
+അല്ലെങ്കിൽ നീ വിശ്വസിക്കുന്ന ആരെയെങ്കിലും സമീപിച്ച്
+നിനക്ക് അനുഭവിക്കുന്നതെല്ലാം അവരോട് തുറന്ന് പറയുക.
+
+ഇന്ത്യയിൽ ആണെങ്കിൽ:
+• AASRA: 91-9820466726 (24/7)
+• Tele MANAS: 14416 (സൗജന്യവും രഹസ്യവുമാണ്)
+അല്ലെങ്കിൽ ഏറ്റവും അടുത്ത അടിയന്തര വിഭാഗത്തിലേക്ക് പോകുക.
+
+നീ ഇതിൽ ഒറ്റക്കല്ല.
+`.trim();
+
+// Instant local responses for common inputs
+const INSTANT_RESPONSES = {
+  'hi': 'Hi there.',
+  'hello': 'Hello.',
+  'hey': 'Hey.',
+  'how are you': 'I\'m here to listen.',
+  'thanks': 'You\'re welcome.',
+  'thank you': 'You\'re welcome.',
+  'ok': 'Okay.',
+  'okay': 'Alright.'
+};
+
+function getInstantResponse(text) {
+  const normalized = text.toLowerCase().trim();
+  const response = INSTANT_RESPONSES[normalized];
+  if (response) {
+    log(`Instant match found: "${normalized}" -> "${response}"`);
+    return response;
+  }
+  return null;
+}
+
+// Default fallback response
+const DEFAULT_FALLBACK = "I'm here to listen. What's on your mind?";
+
+// Format text with line breaks after sentences
+function formatWithLineBreaks(text) {
+  try {
+    return text
+      .replace(/([.!?])\s+/g, '$1\n')
+      .replace(/\s+/g, ' ')
+      .replace(/\n\s+/g, '\n')
+      .trim();
+  } catch (err) {
+    return text || '';
+  }
+}
+
+/* ---------------- Middleware ---------------- */
+
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+  credentials: true
+}));
+app.use(express.json());
+app.use(compression());
+
+/* ---------------- Health ---------------- */
+
+app.get("/health", (_, res) => {
+  res.json({ status: "ok", service: "AIPsych Realtime" });
+});
+
+/* ---------------- Server ---------------- */
+
+const server = app.listen(PORT, () => {
+  log(`AIPsych server running on port ${PORT}`);
+});
+
+/* ---------------- WebSocket Server ---------------- */
+
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  // Per-connection state isolation
+  let currentMode = 'clinical';
+  let crisisResponseSent = false;
+  let conversationHistory = [];
+  
+  function addToHistory(role, content) {
+    conversationHistory.push({ role, content });
+    if (conversationHistory.length > 4) {
+      conversationHistory = conversationHistory.slice(-4);
+    }
+  }
+  
+  function getCurrentPrompt() {
+    return THERAPIST_PROMPTS[currentMode];
+  }
+  
+  function sendResponse(client, type, message) {
+    const formattedMessage = formatWithLineBreaks(message);
+    client.send(JSON.stringify({ type, message: formattedMessage }));
+    log(`Sent ${type}: ${formattedMessage}`);
+  }
+  
+  log('Client connected');
+  
+  ws.on('message', async (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      const userText = message.text?.trim();
+      
+      if (!userText) return;
+      
+      // Crisis detection
+      const isCrisis = keywordCrisis(userText) || await aiCrisisClassifier(userText);
+      
+      if (isCrisis && !crisisResponseSent) {
+        const crisisReply = isMalayalam(userText) ? CRISIS_REPLY_ML : CRISIS_REPLY_EN;
+        sendResponse(ws, 'crisis', crisisReply);
+        crisisResponseSent = true;
+        return;
+      }
+      
+      // Instant responses
+      const instantReply = getInstantResponse(userText);
+      if (instantReply) {
+        sendResponse(ws, 'response', instantReply);
+        return;
+      }
+      
+      // AI response
+      addToHistory('user', userText);
+      
+      try {
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+              { role: 'system', content: getCurrentPrompt() },
+              ...conversationHistory
+            ],
+            max_tokens: 150,
+            temperature: 0.7
+          })
+        });
+        
+        const data = await response.json();
+        const aiReply = data.choices[0].message.content.trim();
+        
+        addToHistory('assistant', aiReply);
+        sendResponse(ws, 'response', aiReply);
+        
+      } catch (err) {
+        log(`AI API error: ${err.message}`, 'ERROR');
+        sendResponse(ws, 'response', DEFAULT_FALLBACK);
+      }
+      
+    } catch (err) {
+      log(`Message processing error: ${err.message}`, 'ERROR');
+    }
+  });
+  
+  ws.on('close', () => {
+    log('Client disconnected');
+  });
 });

@@ -33,7 +33,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
             : '0 4px 20px rgba(147, 51, 234, 0.15)',
         }}
       >
-        <p className="leading-relaxed">{message.text}</p>
+        <p className="leading-relaxed whitespace-pre-line">{message.text}</p>
       </div>
     </motion.div>
   );
