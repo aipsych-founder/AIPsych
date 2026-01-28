@@ -18,6 +18,8 @@ type Message = {
 
 type OrbState = 'idle' | 'listening' | 'speaking';
 
+const API_PORT = import.meta.env.VITE_API_PORT || '3001';
+
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -31,7 +33,8 @@ export default function App() {
   const [inputText, setInputText] = useState('');
   const [orbState, setOrbState] = useState<OrbState>('idle');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [wsInitialized, setWsInitialized] = useState(false); // Prevent double init
+  const wsRef = useRef<WebSocket | null>(null);
+  const currentAIMessageRef = useRef<string>('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
@@ -48,30 +51,38 @@ export default function App() {
   }, [messages]);
 
   useEffect(() => {
-    if (wsInitialized) return; // Prevent double init in StrictMode
-    
-    setWsInitialized(true);
+    // Initialize WebSocket with callback
     initPsychWebSocket((aiChunk, isComplete = false) => {
-      setMessages((prev) => {
-        if (prev.length === 0) return prev;
-
-        const lastMsg = prev[prev.length - 1];
-        if (lastMsg.sender === 'ai') {
-          return prev.map((msg, i) =>
-            i === prev.length - 1
-              ? { ...msg, text: isComplete ? aiChunk : (msg.text + aiChunk) }
-              : msg
-          );
+      setMessages(prev => {
+        // Create shallow copy of messages array
+        const messagesCopy = [...prev];
+        const lastMsg = messagesCopy[messagesCopy.length - 1];
+        
+        if (lastMsg?.sender === 'ai') {
+          if (isComplete) {
+            // Replace the last message's text entirely
+            messagesCopy[messagesCopy.length - 1] = {
+              ...lastMsg,
+              text: aiChunk
+            };
+          } else {
+            // Append the new chunk to existing text
+            messagesCopy[messagesCopy.length - 1] = {
+              ...lastMsg,
+              text: lastMsg.text + aiChunk
+            };
+          }
         }
-        return prev;
+        
+        return messagesCopy;
       });
     });
-    
-    // Cleanup on unmount
+
+    // Cleanup function
     return () => {
-      setWsInitialized(false);
+      // WebSocket cleanup is handled in audioUtils
     };
-  }, [wsInitialized]);
+  }, []); // Empty dependency array - only run once
 
 
   /* =====================================================
@@ -88,22 +99,27 @@ export default function App() {
       timestamp: new Date(),
     };
 
-    setMessages((prev) => [...prev, userMessage]);
+    const aiPlaceholder: Message = {
+      id: (Date.now() + 1).toString(),
+      text: '',
+      sender: 'ai',
+      timestamp: new Date(),
+    };
+
+    // Add both messages at once to prevent flickering
+    setMessages(prev => [...prev, userMessage, aiPlaceholder]);
     setInputText('');
     setIsProcessing(true);
+    currentAIMessageRef.current = '';
 
-    // AI placeholder
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: (Date.now() + 1).toString(),
-        text: '',
-        sender: 'ai',
-        timestamp: new Date(),
-      },
-    ]);
-
-    sendTextMessage(userMessage.text);
+    // Send message via WebSocket
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ text: userMessage.text }));
+    } else {
+      // Use audioUtils sendTextMessage function
+      sendTextMessage(userMessage.text);
+    }
+    
     setIsProcessing(false);
   };
 

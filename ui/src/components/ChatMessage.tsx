@@ -11,6 +11,32 @@ type ChatMessageProps = {
   message: Message;
 };
 
+// Simple markdown-like text renderer
+function renderText(text: string) {
+  // Split by double newlines for paragraphs
+  const paragraphs = text.split('\n\n').filter(p => p.trim());
+  
+  if (paragraphs.length <= 1) {
+    // Single paragraph - preserve line breaks
+    return (
+      <div className="whitespace-pre-line leading-relaxed">
+        {text}
+      </div>
+    );
+  }
+  
+  // Multiple paragraphs
+  return (
+    <div className="space-y-3">
+      {paragraphs.map((paragraph, index) => (
+        <p key={index} className="leading-relaxed whitespace-pre-line">
+          {paragraph.trim()}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 export function ChatMessage({ message }: ChatMessageProps) {
   const isAI = message.sender === 'ai';
 
@@ -33,7 +59,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
             : '0 4px 20px rgba(147, 51, 234, 0.15)',
         }}
       >
-        <p className="leading-relaxed whitespace-pre-line">{message.text}</p>
+        {renderText(message.text)}
       </div>
     </motion.div>
   );

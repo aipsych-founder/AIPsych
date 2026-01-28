@@ -6,6 +6,12 @@ import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 
+// Ensure fetch is available for Node.js < 18
+if (!globalThis.fetch) {
+  const { default: fetch } = await import('node-fetch');
+  globalThis.fetch = fetch;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -188,7 +194,11 @@ function formatWithLineBreaks(text) {
 /* ---------------- Middleware ---------------- */
 
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || [
+    'http://localhost:3000',
+    'http://localhost:5173', // Vite default port
+    `http://localhost:${PORT}` // Dynamic server port
+  ],
   credentials: true
 }));
 app.use(express.json());
@@ -198,6 +208,66 @@ app.use(compression());
 
 app.get("/health", (_, res) => {
   res.json({ status: "ok", service: "AIPsych Realtime" });
+});
+
+/* ---------------- REST API Fallback ---------------- */
+
+app.post("/api/psych", async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text?.trim()) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    const userText = text.trim();
+    
+    // Crisis detection
+    const isCrisis = keywordCrisis(userText) || await aiCrisisClassifier(userText);
+    
+    if (isCrisis) {
+      const crisisReply = isMalayalam(userText) ? CRISIS_REPLY_ML : CRISIS_REPLY_EN;
+      return res.json({ type: 'crisis', message: formatWithLineBreaks(crisisReply) });
+    }
+    
+    // Instant responses
+    const instantReply = getInstantResponse(userText);
+    if (instantReply) {
+      return res.json({ type: 'response', message: instantReply });
+    }
+    
+    // AI response
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: THERAPIST_PROMPTS.clinical },
+            { role: 'user', content: userText }
+          ],
+          max_tokens: 150,
+          temperature: 0.7
+        })
+      });
+      
+      const data = await response.json();
+      const aiReply = data.choices[0].message.content.trim();
+      
+      res.json({ type: 'response', message: formatWithLineBreaks(aiReply) });
+      
+    } catch (err) {
+      log(`AI API error: ${err.message}`, 'ERROR');
+      res.json({ type: 'response', message: DEFAULT_FALLBACK });
+    }
+    
+  } catch (err) {
+    log(`REST API error: ${err.message}`, 'ERROR');
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 /* ---------------- Server ---------------- */
@@ -238,14 +308,21 @@ wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
-      const userText = message.text?.trim();
       
+      // Handle different message types
+      if (message.type === 'input_audio_buffer.append') {
+        // Handle audio input - forward to OpenAI or process locally
+        handleAudioInput(ws, message);
+        return;
+      }
+      
+      const userText = message.text?.trim();
       if (!userText) return;
       
-      // Crisis detection
-      const isCrisis = keywordCrisis(userText) || await aiCrisisClassifier(userText);
+      // Fast keyword crisis check
+      const keywordCrisisDetected = keywordCrisis(userText);
       
-      if (isCrisis && !crisisResponseSent) {
+      if (keywordCrisisDetected && !crisisResponseSent) {
         const crisisReply = isMalayalam(userText) ? CRISIS_REPLY_ML : CRISIS_REPLY_EN;
         sendResponse(ws, 'crisis', crisisReply);
         crisisResponseSent = true;
@@ -259,32 +336,47 @@ wss.on('connection', (ws) => {
         return;
       }
       
-      // AI response
+      // AI response with parallel crisis detection
       addToHistory('user', userText);
       
+      // Start both AI response and crisis detection in parallel
+      const aiResponsePromise = fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: getCurrentPrompt() },
+            ...conversationHistory
+          ],
+          max_tokens: 150,
+          temperature: 0.7
+        })
+      });
+      
+      const crisisCheckPromise = !keywordCrisisDetected ? aiCrisisClassifier(userText) : Promise.resolve(false);
+      
       try {
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [
-              { role: 'system', content: getCurrentPrompt() },
-              ...conversationHistory
-            ],
-            max_tokens: 150,
-            temperature: 0.7
-          })
-        });
+        const [aiResponse, isCrisisAI] = await Promise.all([aiResponsePromise, crisisCheckPromise]);
         
-        const data = await response.json();
+        // Check if AI detected crisis and we haven't sent crisis response yet
+        if (isCrisisAI && !crisisResponseSent) {
+          const crisisReply = isMalayalam(userText) ? CRISIS_REPLY_ML : CRISIS_REPLY_EN;
+          sendResponse(ws, 'crisis', crisisReply);
+          crisisResponseSent = true;
+          return;
+        }
+        
+        const data = await aiResponse.json();
         const aiReply = data.choices[0].message.content.trim();
         
         addToHistory('assistant', aiReply);
-        sendResponse(ws, 'response', aiReply);
+        
+        // Send response with audio transcript delta format for compatibility
+        sendResponseWithAudio(ws, aiReply);
         
       } catch (err) {
         log(`AI API error: ${err.message}`, 'ERROR');
@@ -295,6 +387,42 @@ wss.on('connection', (ws) => {
       log(`Message processing error: ${err.message}`, 'ERROR');
     }
   });
+  
+  // Handle audio input processing
+  function handleAudioInput(client, message) {
+    // For now, acknowledge audio input
+    // In a full implementation, this would process audio or forward to OpenAI Realtime API
+    log('Audio input received');
+  }
+  
+  // Enhanced response function with audio transcript delta support
+  function sendResponseWithAudio(client, text) {
+    const formattedMessage = formatWithLineBreaks(text);
+    
+    // Send as audio transcript delta for compatibility with audioUtils.ts
+    const words = formattedMessage.split(' ');
+    
+    // Send word by word to simulate streaming
+    words.forEach((word, index) => {
+      setTimeout(() => {
+        client.send(JSON.stringify({
+          type: 'response.audio_transcript.delta',
+          delta: word + (index < words.length - 1 ? ' ' : '')
+        }));
+        
+        // Send done event after last word
+        if (index === words.length - 1) {
+          setTimeout(() => {
+            client.send(JSON.stringify({ type: 'response.done' }));
+          }, 50);
+        }
+      }, index * 100); // 100ms delay between words
+    });
+    
+    // Also send traditional response format
+    client.send(JSON.stringify({ type: 'response', message: formattedMessage }));
+    log(`Sent response with audio transcript: ${formattedMessage}`);
+  }
   
   ws.on('close', () => {
     log('Client disconnected');

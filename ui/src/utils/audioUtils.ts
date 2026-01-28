@@ -1,6 +1,7 @@
 // Audio utilities for recording and playback
 
-const API_BASE_URL = 'http://localhost:3001';
+const API_PORT = import.meta.env.VITE_API_PORT || '3001';
+const API_BASE_URL = `http://localhost:${API_PORT}`;
 
 /* =====================================================
    🎧 AUDIO RECORDING (UNCHANGED)
@@ -48,29 +49,38 @@ let onAIMessage: ((text: string, isComplete?: boolean) => void) | null = null;
 let isConnecting = false; // Prevent duplicate connections
 let currentAIText = ''; // Track accumulated text for formatting
 
-// Smart text merging with punctuation-aware spacing
+// Smart text merging with Malayalam character support
 function mergeTextChunk(chunk: string, previousText: string = ''): string {
   try {
     if (!chunk || typeof chunk !== 'string') return chunk || '';
     
-    // Trim leading spaces from incoming chunk
-    const trimmedChunk = chunk.trimStart();
-    if (!trimmedChunk) return '';
-    
-    if (!previousText) return trimmedChunk;
+    // Don't modify the chunk - preserve all spacing as sent by AI
+    if (!previousText) return chunk;
     
     const lastChar = previousText.slice(-1);
-    const firstChar = trimmedChunk.charAt(0);
+    const firstChar = chunk.charAt(0);
     
-    // Insert space if:
-    // 1. Previous char is letter and next starts with letter
-    // 2. Previous char is ?, !, . and next starts with letter
-    if ((/[a-zA-Z\u0D00-\u0D7F]/.test(lastChar) && /[a-zA-Z\u0D00-\u0D7F]/.test(firstChar)) ||
-        (/[.!?]/.test(lastChar) && /[a-zA-Z\u0D00-\u0D7F]/.test(firstChar))) {
-      return ' ' + trimmedChunk;
+    // Don't add space if chunk already starts with whitespace
+    if (/\s/.test(firstChar)) return chunk;
+    
+    // Add space between Malayalam characters to prevent sticking
+    const isMalayalamLast = /[\u0D00-\u0D7F]/.test(lastChar);
+    const isMalayalamFirst = /[\u0D00-\u0D7F]/.test(firstChar);
+    const isLetterLast = /[a-zA-Z]/.test(lastChar);
+    const isLetterFirst = /[a-zA-Z]/.test(firstChar);
+    
+    // Add space between:
+    // 1. Malayalam characters
+    // 2. English letters
+    // 3. Mixed Malayalam and English
+    if ((isMalayalamLast && isMalayalamFirst) ||
+        (isLetterLast && isLetterFirst) ||
+        (isMalayalamLast && isLetterFirst) ||
+        (isLetterLast && isMalayalamFirst)) {
+      return ' ' + chunk;
     }
     
-    return trimmedChunk;
+    return chunk;
   } catch (err) {
     return chunk || '';
   }
@@ -89,10 +99,7 @@ function formatWithLineBreaks(text: string): string {
   }
 }
 
-// Check if chunk completes a sentence
-function completesSentence(chunk: string): boolean {
-  return /[.!?]\s*$/.test(chunk.trim());
-}
+
 
 export function initPsychWebSocket(handler: (text: string, isComplete?: boolean) => void) {
   // Prevent duplicate connections in StrictMode
@@ -101,7 +108,7 @@ export function initPsychWebSocket(handler: (text: string, isComplete?: boolean)
   isConnecting = true;
   onAIMessage = handler;
   currentAIText = ''; // Reset text accumulation
-  ws = new WebSocket('ws://localhost:3001');
+  ws = new WebSocket(`ws://localhost:${API_PORT}`);
 
   ws.onopen = () => {
     console.log('🟢 Connected to AIPsych WebSocket');
@@ -142,25 +149,11 @@ export function initPsychWebSocket(handler: (text: string, isComplete?: boolean)
       // STREAMING TEXT from audio transcript
       if (data.type === 'response.audio_transcript.delta') {
         if (typeof data.delta === 'string') {
-          let processedChunk = data.delta;
-          try {
-            // Apply smart merging with spacing rules
-            if (typeof mergeTextChunk === 'function') {
-              processedChunk = mergeTextChunk(data.delta, currentAIText) || data.delta;
-              
-              // Add newline if chunk completes a sentence
-              if (completesSentence(processedChunk)) {
-                processedChunk += '\n';
-              }
-              
-              currentAIText += processedChunk;
-            }
-          } catch (err) {
-            // Merging failed - use original
-            processedChunk = data.delta;
-          }
+          // Don't trim - preserve all spacing sent by AI
+          const processedChunk = data.delta;
           
           if (processedChunk) {
+            currentAIText += processedChunk;
             onAIMessage?.(processedChunk);
           }
         }
@@ -219,7 +212,10 @@ export function sendTextMessage(text: string) {
     return;
   }
 
-  ws.send(JSON.stringify({ text }));
+  // Only send if WebSocket is open
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ text }));
+  }
 }
 
 let lastSendTime = 0; // Debounce variable
@@ -228,6 +224,30 @@ let lastSendTime = 0; // Debounce variable
    🎙️ VOICE (LEFT AS-IS / PLACEHOLDER)
 ===================================================== */
 
-export async function transcribeAndRespond(_: Blob): Promise<any> {
-  throw new Error('Voice pipeline not wired to WebSocket yet');
+export async function transcribeAndRespond(audioBlob: Blob): Promise<void> {
+  try {
+    // Convert audio blob to base64
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const uint8Array = new Uint8Array(arrayBuffer);
+    const base64Audio = btoa(String.fromCharCode(...uint8Array));
+    
+    // Send audio over WebSocket if connected
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: base64Audio
+      }));
+      
+      // Commit the audio buffer
+      ws.send(JSON.stringify({
+        type: 'input_audio_buffer.commit'
+      }));
+    } else {
+      console.warn('WebSocket not connected, cannot send audio');
+      // Could implement REST API fallback here if needed
+    }
+  } catch (error) {
+    console.error('Error processing audio:', error);
+    throw error;
+  }
 }

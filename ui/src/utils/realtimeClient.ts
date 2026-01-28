@@ -1,8 +1,9 @@
 // Realtime WebSocket client for OpenAI's Realtime API
 
-const API_BASE_URL = 'http://localhost:3001';
-// Connect to local server WebSocket proxy which will forward to OpenAI
-const REALTIME_URL = `${API_BASE_URL.replace(/^http/, 'ws')}/realtime`;
+const API_PORT = import.meta.env.VITE_API_PORT || '3001';
+const API_BASE_URL = `http://localhost:${API_PORT}`;
+// Connect to root WebSocket endpoint to match server implementation
+const REALTIME_URL = `ws://localhost:${API_PORT}`;
 
 type RealtimeEventType =
   | 'session.created'
@@ -256,9 +257,10 @@ export class RealtimeClient {
  */
 export class RealtimeAudioProcessor {
   private audioContext: AudioContext;
-  private sourceNode: AudioBufferSourceNode | null = null;
-  private audioBuffer: Float32Array = new Float32Array(0);
+  private audioQueue: Float32Array[] = [];
+  private isPlaying: boolean = false;
   private sampleRate: number = 24000; // Realtime API uses 24kHz
+  private nextStartTime: number = 0;
 
   constructor() {
     this.audioContext =
@@ -281,34 +283,66 @@ export class RealtimeAudioProcessor {
   }
 
   /**
-   * Play audio chunk immediately
+   * Play audio chunk with smooth buffering to prevent popping
    */
   async playAudioChunk(audioData: Uint8Array): Promise<void> {
     const float32 = this.pcm16ToFloat32(audioData);
-
-    // Concatenate with buffer
-    const newBuffer = new Float32Array(this.audioBuffer.length + float32.length);
-    newBuffer.set(this.audioBuffer);
-    newBuffer.set(float32, this.audioBuffer.length);
-    this.audioBuffer = newBuffer;
-
-    // Create and play buffer
-    // Ensure audio context is running (user interaction may be required)
+    
+    // Ensure audio context is running
     if (this.audioContext.state === 'suspended') {
       try {
         await this.audioContext.resume();
       } catch (e) {
         console.warn('Could not resume audioContext:', e);
+        return;
       }
     }
 
-    const audioBuffer = this.audioContext.createBuffer(1, float32.length, this.sampleRate);
-    audioBuffer.getChannelData(0).set(float32);
+    // Add to queue
+    this.audioQueue.push(float32);
+    
+    // Start playing if not already playing
+    if (!this.isPlaying) {
+      this.isPlaying = true;
+      this.nextStartTime = this.audioContext.currentTime;
+      this.playNextChunk();
+    }
+  }
+
+  /**
+   * Play next chunk in queue with seamless timing
+   */
+  private playNextChunk(): void {
+    if (this.audioQueue.length === 0) {
+      this.isPlaying = false;
+      return;
+    }
+
+    const chunk = this.audioQueue.shift()!;
+    const audioBuffer = this.audioContext.createBuffer(1, chunk.length, this.sampleRate);
+    audioBuffer.getChannelData(0).set(chunk);
 
     const sourceNode = this.audioContext.createBufferSource();
     sourceNode.buffer = audioBuffer;
-    sourceNode.connect(this.audioContext.destination);
-    sourceNode.start();
+    
+    // Apply slight fade to prevent popping
+    const gainNode = this.audioContext.createGain();
+    gainNode.gain.setValueAtTime(0, this.nextStartTime);
+    gainNode.gain.linearRampToValueAtTime(1, this.nextStartTime + 0.01); // 10ms fade in
+    gainNode.gain.setValueAtTime(1, this.nextStartTime + audioBuffer.duration - 0.01);
+    gainNode.gain.linearRampToValueAtTime(0, this.nextStartTime + audioBuffer.duration); // 10ms fade out
+    
+    sourceNode.connect(gainNode);
+    gainNode.connect(this.audioContext.destination);
+    
+    sourceNode.start(this.nextStartTime);
+    
+    // Schedule next chunk
+    this.nextStartTime += audioBuffer.duration;
+    
+    sourceNode.onended = () => {
+      this.playNextChunk();
+    };
   }
 
   /**
